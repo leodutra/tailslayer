@@ -1,19 +1,26 @@
 #include <tailslayer/hedged_reader.hpp>
 #include <iostream>
 
-// void dumb_wait(int arg1, int arg2) {
-//     std::cout << "Hi\n";
-// }
-
-// template <typename T>
-// void dumb_work(T val, int arg2) {
-//     std::cout << "Hi\n";
-// }
-
 /*
 Example user functions that could be passed to tailslayer
 */
+
+// Example with arguments
+[[gnu::always_inline]] inline std::size_t dummy_read_signal2(int arg1, int arg2) {
+    std::cout << "Hi with args: " << arg1 << " " << arg2 << "\n";
+    return 0; // Index to read
+}
+
+template <typename T>
+[[gnu::always_inline]] inline void dummy_final_work2(T val, int arg2) {
+    std::cout << "Hi with args: " << val << " " << arg2 << "\n";
+}
+
+// Example with no arguments
 [[gnu::always_inline]] inline std::size_t dummy_read_signal() {
+    // UPDATE HERE - signal
+    // This is the signal that the worker will wait for
+    // Once this loop completes, the read will be triggered
     uint64_t starting_time_dumb = tailslayer::detail::rdtsc_lfence();
     tailslayer::detail::rdtsc_lfence();
     uint64_t num_cycles{0};
@@ -21,13 +28,15 @@ Example user functions that could be passed to tailslayer
         num_cycles = tailslayer::detail::rdtsc_lfence() - starting_time_dumb;
     } while (num_cycles < 2000000000);
 
-    std::size_t dummy_offset = 1; // Let's read the second value
-
-    return dummy_offset;
+    // UPDATE HERE - index
+    std::size_t index_to_read = 1; // Desired index to read (example reading the second value 0x44)
+    return index_to_read;
 }
 
 template <typename T>
 [[gnu::always_inline]] inline void dummy_final_work(T val) {
+    // UPDATE HERE - final work
+    // This is the function that will be executed with the value as soon as the signal function finishes
     asm volatile("" :: "r"(val)); // Dummy using value
     std::cout << "Val: " << val << "\n";
 }
@@ -38,27 +47,13 @@ int main() {
 
     std::cout << "Start tailslayer demo.\n";
 
-    // std::cout << "Normal dumb read:\n";
-    // uint64_t t0, t1;
-    // volatile target_size_t normal_val = 0x43;
-    // for (int i = 0; i < 10; i++) {
-    //     tailslayer::detail::clflush_addr(&normal_val);
-    //     tailslayer::detail::mfence_inst();
-    //     t0 = tailslayer::detail::rdtsc_lfence();
-    //     target_size_t val = normal_val;
-    //     asm volatile("" :: "r"(val));
-    //     t1 = tailslayer::detail::rdtscp_lfence();
-    //     std::cout << "t0: " << t0 << "\n";
-    //     std::cout << "t1: " << t1 << "\n";
-    //     std::cout << "Time: " << t1 - t0 << " cycles\n";
-    // }
-    // std::cout << "Done with normal dumb read\n";
+    // Example with arguments
+    // tailslayer::HedgedReader<target_size_t, dummy_read_signal2, dummy_final_work2<target_size_t>, tailslayer::ArgList<1, 2>, tailslayer::ArgList<2>> reader_args{};
+    // reader_args.insert(0x43);
+    // reader_args.insert(0x44);
+    // reader_args.start_workers();
 
-    // Example with args:
-    // using WaitArgs = tailslayer::ArgList<1, 2>;
-    // using WorkArgs = tailslayer::ArgList<2>;
-    // tailslayer::HedgedReader<target_size_t, dumb_wait, dumb_work<target_size_t>, WaitArgs, WorkArgs> reader_args{};
-
+    // Example with no arguments
     tailslayer::HedgedReader<target_size_t, dummy_read_signal, dummy_final_work<target_size_t>> reader{};
     reader.insert(0x43);
     reader.insert(0x44);
