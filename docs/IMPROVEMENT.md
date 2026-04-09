@@ -10,10 +10,12 @@ The current system already implements the **core execution model** of Tail Slaye
 
 * replicated data across memory regions
 * independent worker threads pinned to cores
-* no synchronization in the hot read path
+* no inter-worker synchronization in the hot read path
 * deterministic address computation
 
 These properties must remain unchanged.
+
+Separate cores are also mandatory. Hedging two reads on a single core does not preserve independence because retirement is still ordered through one reorder buffer (ROB). Even if both misses are dispatched in parallel, the fast read can still be delayed behind the slow one at retirement. Tail Slayer therefore requires **one worker per replica on a distinct core**.
 
 This specification addresses only the **missing operational, correctness, and hardware-alignment aspects** required to transform the system into a **continuous, production-grade Tail Slayer engine**.
 
@@ -30,7 +32,7 @@ The current implementation performs raw memory writes and reads:
 T value = *target_addr;
 ```
 
-This introduces undefined behavior under the C++ memory model because:
+This is only safe if replica contents are fully initialized **before** workers start and then remain immutable. If replica contents are updated while workers are active, it introduces undefined behavior under the C++ memory model because:
 
 * there is no happens-before relationship between producer and consumer
 * compilers and CPUs are allowed to reorder operations
@@ -42,7 +44,12 @@ Even if this appears to work on x86 due to TSO (Total Store Order), it is not gu
 
 ## Solution
 
-Introduce **minimal acquire/release semantics** using `std::atomic_ref<T>`.
+Prefer **immutable replica tables after startup**.
+
+If live replica updates are required, use one of two safe publication modes:
+
+1. **atomic-payload mode** for payloads that fit the lock-free `std::atomic_ref<T>` contract
+2. **versioned-slot mode** for larger or composite payloads, where slot metadata brackets the write and readers retry on overlap
 
 ### Write
 
@@ -60,28 +67,40 @@ T value = std::atomic_ref<T>(*target_addr).load(std::memory_order_acquire);
 
 ## Constraints
 
-The following must hold:
+For the atomic-payload mode, the following must hold:
 
 ```cpp
 static_assert(std::is_trivially_copyable_v<T>);
-static_assert(sizeof(T) <= 8); // or native atomic width
-static_assert(alignof(T) >= sizeof(T));
+static_assert(std::atomic_ref<T>::is_always_lock_free);
+static_assert(alignof(T) >= std::atomic_ref<T>::required_alignment);
 ```
+
+Additionally, every computed replica address must satisfy:
+
+```cpp
+assert(reinterpret_cast<std::uintptr_t>(target_addr) %
+    std::atomic_ref<T>::required_alignment == 0);
+```
+
+If a payload does **not** meet these constraints, live updates must use versioned slot metadata instead of direct `atomic_ref<T>` reads and writes.
 
 ---
 
 ## Explanation
 
-* `release` ensures all prior writes are visible before publishing the value
-* `acquire` ensures the reader observes the latest value
-* on x86, this compiles to plain loads/stores (no fences), preserving performance
+* if replicas are populated once and then treated as immutable, no per-read atomic is needed on the worker hot path
+* if replicas are mutated live in atomic-payload mode, `release` ensures the publisher finishes the write before exposing it
+* `acquire` ensures the reader observes the published value
+* on x86, lock-free widths typically compile to plain loads/stores, preserving performance
 * on weaker architectures, barriers are inserted only where required
+* this technique is valid only for payload types and placements that satisfy the `atomic_ref` lock-free and alignment contract
+* larger payloads require a separate publish protocol; a single version counter with no “write in progress” state is not sufficient
 
-This change **fixes correctness without introducing overhead**.
+This change **fixes correctness while preserving the no-lock hot path**.
 
 ---
 
-# 2. Broadcast-Based Request Dispatch
+# 2. Trigger Duplication and Request Dispatch
 
 ## Problem
 
@@ -95,54 +114,83 @@ A queue:
 Tail Slayer requires:
 
 * **all workers to process the same request simultaneously**
+* **every published request to be observable by every worker**
+
+The creator’s execution model is not “one thread broadcasts, all others contend on shared state.” It is “the same logical request arrives independently at each worker, each worker reads its own replica, and loser suppression happens elsewhere.”
+
+A single destructive queue breaks this model immediately.
 
 ---
 
 ## Solution
 
-Replace queue semantics with a **global broadcast sequencer**.
+Duplicate the logical trigger **before** the worker hot path.
+
+Preferred sources of duplication are:
+
+* NIC or kernel fan-out that delivers the same packet / request to multiple worker queues
+* application-level broadcast that creates one request copy per worker before the read path begins
+* benchmark-only synthetic timers that fire independently per worker
+
+A shared software sequencer may exist for non-critical orchestration, but it must not become the latency-critical arbitration point.
 
 ---
 
 ## Design
 
 ```cpp
-std::atomic<std::size_t> global_seq;
+struct Request {
+    std::uint64_t request_id;
+    std::size_t logical_index;
+    // immutable packet pointer, timestamp, or other request context
+};
 ```
 
 ---
 
-## Producer Flow
+## Ingress Flow
 
-For request index `i`:
+For each logical request:
 
 ```cpp
-// prepare data first
-global_seq.store(i, std::memory_order_release);
+Request req{.request_id = next_id(), .logical_index = index};
+duplicate_to_all_workers(req);
 ```
+
+If this duplication traverses shared memory, the publication channel must itself establish a happens-before edge. For example, a software fan-out implementation should prefer one SPSC queue per worker with release on enqueue and acquire on dequeue:
+
+```cpp
+per_worker_queue[i].push(req, std::memory_order_release);
+auto req = per_worker_queue[i].pop(std::memory_order_acquire);
+```
+
+Kernel or NIC fan-out may rely on the queueing semantics of that subsystem, but the contract is the same: the worker must not observe a partially published request context.
 
 ---
 
 ## Worker Flow
 
 ```cpp
-std::size_t local_seq = last_seen;
+for (;;) {
+    auto req = wait_work(running_, WaitArgs...);
+    if (!req) {
+        break;
+    }
 
-while (local_seq == global_seq.load(std::memory_order_acquire)) {
-    // spin
+    std::size_t idx = req->logical_index;
+    process_request(*req, idx);
 }
-
-local_seq = global_seq.load(std::memory_order_acquire);
 ```
 
 ---
 
 ## Explanation
 
-* this creates a **single-writer, multi-reader broadcast**
-* all workers observe the same index
-* no contention between workers
-* no destructive reads
+* each worker receives the same logical request independently
+* no destructive reads occur inside the worker hot path
+* worker independence is preserved all the way through the memory read
+* the request-delivery path itself has a defined publication contract
+* this matches the creator’s intended deployment model, where ingress duplication is external and loser suppression happens later
 
 This is essential because:
 
@@ -150,7 +198,7 @@ This is essential because:
 
 ---
 
-# 3. Per-Request State Lifecycle (Winner Control)
+# 3. Winner Selection Placement
 
 ## Problem
 
@@ -160,62 +208,59 @@ Winner selection uses:
 atomic<bool> done;
 ```
 
-In a persistent system:
+In a persistent system, placing a shared winner flag directly in the worker path introduces cross-core synchronization and cache-line bouncing exactly where Tail Slayer is trying to eliminate tail latency.
 
-* this must be reset for every request
-* otherwise only the first request works
+The original researcher explicitly notes that even a small shared atomic in this path was enough to destroy the benefit in practice.
 
 ---
 
 ## Solution
 
-Introduce a **ring buffer of per-request state objects**.
+Keep the read-and-process path fully independent through completion.
+
+Winner selection or loser suppression must happen **outside** the read hot path.
+
+To preserve the researcher’s findings, the hot-path callback must be treated as a **pure compute stage** or an **idempotent candidate-construction stage**, not as the place where irreversible side effects are emitted.
+
+Acceptable placements are:
+
+* NIC / FPGA / gateway deduplication of outgoing actions
+* idempotent downstream consumers keyed by request identity
+* a post-read control-plane observer that is not on the latency-critical path
+
+If an application insists on an in-process winner flag, that is a compatibility mode, not the primary Tail Slayer design.
 
 ---
 
 ## Structure
 
 ```cpp
-struct alignas(64) RequestState {
-    std::atomic<bool> done;
-};
-```
-
-```cpp
-std::vector<RequestState> states; // size = capacity
+Candidate candidate = final_work(req, value, WorkArgs...); // per-worker compute only
 ```
 
 ---
 
-## Producer Flow (for request i)
+## Worker Outcome
 
 ```cpp
-states[i].done.store(false, std::memory_order_release);
-global_seq.store(i, std::memory_order_release);
-```
-
----
-
-## Worker Flow
-
-```cpp
-if (!states[i].done.exchange(true, std::memory_order_relaxed)) {
-    final_work(...);
-}
+emit_result_or_action(req.request_id, candidate);
+// loser suppression occurs downstream or off-core
 ```
 
 ---
 
 ## Explanation
 
-* `alignas(64)` prevents false sharing between workers
-* reset must happen **before publishing the request**
-* `exchange` ensures only one worker succeeds
-* relaxed ordering is sufficient because this is a single-winner flag
+* no shared atomic sits between the worker and its completion path
+* workers remain independent on separate cores, which is the whole point of the technique
+* `final_work` is constrained so duplicate execution does not create duplicate irreversible effects
+* loser suppression still exists, but it is moved off the critical read path
 
 This ensures:
 
-> Only the fastest worker produces a result, eliminating tail latency impact.
+> the fastest worker can win without forcing every worker to fight over a shared cache line first.
+
+If the existing API name `final_work` is retained for compatibility, the documentation must explicitly state that it is a per-worker compute hook. Direct transmission, order placement, or other non-idempotent side effects must happen in a later deduplicated stage.
 
 ---
 
@@ -242,16 +287,17 @@ Convert workers into **persistent hot loops**.
 ## Design
 
 ```cpp
-while (running_) {
-    std::size_t seq = wait_for_sequence();
-    std::size_t idx = seq & capacity_mask_;
+for (;;) {
+    auto req = wait_work(running_, WaitArgs...);
+    if (!req) {
+        break;
+    }
+
+    std::size_t idx = req->logical_index;
 
     T* addr = get_next_logical_index_address(worker_id, idx);
-    T value = load(addr);
-
-    if (!states[idx].done.exchange(true, std::memory_order_relaxed)) {
-        final_work(value);
-    }
+    T value = load(addr); // plain load for immutable tables, acquire load for live-update mode
+    final_work(*req, value, WorkArgs...);
 }
 ```
 
@@ -260,23 +306,26 @@ while (running_) {
 ## Explanation
 
 * workers remain active and pinned
-* no wake-up latency
-* continuous processing model
+* no wake-up latency is introduced between requests
+* each worker handles the same logical request from its own duplicated trigger source
+* no shared winner arbitration pollutes the critical path
 * aligns with real-world low-latency systems
 
 ---
 
 ## Requirement for wait mechanism
 
-`wait_for_sequence` must:
+`wait_work(...)` must:
 
 * be non-blocking
 * avoid syscalls
-* typically spin or poll shared memory
+* make the same logical request available to every worker independently
+* poll `running_` in the wait loop and return an empty result on shutdown
+* avoid a single destructive consumer queue shared by all workers
 
 ---
 
-# 5. Ring Buffer Wraparound
+# 5. Replica Storage Lifecycle
 
 ## Problem
 
@@ -286,16 +335,25 @@ The original system assumes a bounded index:
 assert(logical_index < capacity);
 ```
 
-In a continuous system:
-
-* index grows indefinitely
-* leads to overflow or invalid memory access
+That is acceptable for a preloaded immutable table, but insufficient if the library is extended to support **live updates of a bounded mutable store**.
 
 ---
 
 ## Solution
 
-Convert to **power-of-two ring buffer addressing**.
+Define the supported storage modes explicitly.
+
+### Immutable-table mode (preferred)
+
+1. allocate and place replicas
+2. populate all data before worker startup
+3. treat replica contents as read-only during steady-state operation
+
+This mode needs no wraparound logic because requests select indices from an already built table.
+
+### Live-update mode (optional)
+
+If the library must support bounded mutable storage while workers are running, use a **power-of-two ring with generation metadata**.
 
 ---
 
@@ -303,7 +361,7 @@ Convert to **power-of-two ring buffer addressing**.
 
 ```cpp
 std::size_t capacity_mask = capacity - 1;
-static_assert((capacity & (capacity - 1)) == 0);
+assert((capacity & (capacity - 1)) == 0);
 ```
 
 ---
@@ -311,23 +369,57 @@ static_assert((capacity & (capacity - 1)) == 0);
 ## Indexing
 
 ```cpp
-std::size_t idx = logical_index & capacity_mask;
+std::size_t idx = seq & capacity_mask;
+```
+
+Each mutable slot needs version metadata with a write-in-progress state:
+
+```cpp
+struct alignas(64) SlotMeta {
+    std::atomic<std::size_t> version; // odd = writer owns slot, even = stable
+};
+```
+
+One safe pattern is:
+
+```cpp
+// writer
+auto base = slot.version.load(std::memory_order_relaxed);
+slot.version.store(base + 1, std::memory_order_relaxed); // odd
+write_payload(slot);
+slot.version.store(base + 2, std::memory_order_release); // even, publish
+
+// reader
+for (;;) {
+    auto before = slot.version.load(std::memory_order_acquire);
+    if (before & 1) {
+        cpu_relax();
+        continue;
+    }
+
+    Payload copy = read_payload(slot);
+    auto after = slot.version.load(std::memory_order_acquire);
+    if (before == after) {
+        consume(copy);
+        break;
+    }
+}
 ```
 
 ---
 
 ## Explanation
 
-* replaces modulo with bitwise AND
-* constant-time, zero overhead
-* safe wraparound
-* preserves cache locality
+* most Tail Slayer deployments want immutable replica tables, not a mutable shared ring
+* separating the two modes avoids paying synchronization costs for a feature the core methodology does not need
+* if live updates are enabled, versioned slots are required both to avoid ABA during reuse and to distinguish stable data from a write in progress
+* power-of-two addressing still keeps wraparound constant-time
 
 ---
 
 ## Constraint
 
-Producer must not overwrite entries still being processed.
+If live-update mode is implemented, the producer must not reuse a slot until no worker can still observe the previous generation.
 
 ---
 
@@ -352,36 +444,46 @@ Use **statistical independence detection**, not structural assumptions.
 
 ## Method
 
-For two candidate addresses A and B:
+For two candidate addresses `A` and `B`:
 
-1. Measure latency distributions:
+1. Run **synchronized paired trials** so each sample records the same event window on both addresses:
 
-   * `lat(A)`
-   * `lat(B)`
-   * `lat(min(A,B))`
+    * `latA[k]`
+    * `latB[k]`
+    * `latMin[k] = min(latA[k], latB[k])`
 
-2. Compare high-percentile latency:
+2. Compare both marginal tails and the **joint tail** across several high thresholds `t`:
 
 ```text
-If P99.9(min(A,B)) << min(P99.9(A), P99.9(B))
-→ A and B are independent
+Let pA(t)  = P(latA > t)
+    pB(t)  = P(latB > t)
+    pAB(t) = P(latA > t and latB > t)
+
+If pAB(t) is close to pA(t) * pB(t) within measurement error,
+then the paths are behaving approximately independently at that threshold.
+
+If pAB(t) >> pA(t) * pB(t), the paths are still correlated and should be rejected.
+
+Strict mathematical independence is not required for Tail Slayer to help,
+but low co-stall probability and a materially improved tail in latMin are required.
 ```
 
 ---
 
 ## Requirements
 
-* large sample size (≥ 1M reads)
-* percentile or CCDF analysis
+* large sample size (≥ 1M **paired** reads)
+* percentile, CCDF, or joint-tail analysis with confidence bounds where practical
 * repeat measurements to reduce noise
+* use physical-address or hardware-counter heuristics only as a **prefilter**, never as final proof
 
 ---
 
 ## Explanation
 
-* refresh stalls are per-channel
-* independence of stalls is what matters
-* avoids reverse engineering hardware
+* refresh stalls are per-channel, so **co-stall probability** is what matters more than perfect textbook independence
+* paired measurements avoid misleading conclusions from unrelated timing noise
+* avoids overfitting to undocumented hardware hashing rules
 
 This ensures:
 
@@ -427,19 +529,25 @@ numa_alloc_onnode(size, node);
 
 ## Additional Requirement
 
+NUMA policy must be established **before first touch**. Two valid patterns are:
+
+1. allocate directly on the target node with `numa_alloc_onnode`, then pre-fault / touch the pages from a thread pinned to that node
+2. `mmap` without `MAP_POPULATE`, apply `mbind`, then explicitly pre-fault the region from a thread pinned to the target node
+
 Use:
 
 ```cpp
 MAP_POPULATE
 ```
 
-in `mmap` to pre-fault pages.
+only if the desired NUMA policy is already active **before** the mapping is created.
 
 ---
 
 ## Explanation
 
-* ensures memory is physically located near worker cores
+* binding after pages have already been faulted is too late
+* correct ordering ensures memory is physically located near worker cores
 * avoids interconnect latency (QPI/UPI)
 * preserves low-latency assumptions
 
@@ -495,16 +603,23 @@ Persistent workers require a termination mechanism.
 Introduce:
 
 ```cpp
-std::atomic<bool> running_;
+std::atomic<bool> running_{true};
 ```
 
 ---
 
-## Worker Loop
+## Wait Path
 
 ```cpp
+std::optional<Request> wait_work(std::atomic<bool>& running, WaitArgs...);
+// implementation-specific, but every spin or poll loop must consult running
+
 while (running_.load(std::memory_order_relaxed)) {
-    ...
+    auto req = wait_work(running_, WaitArgs...);
+    if (!req) {
+        break;
+    }
+    // process request
 }
 ```
 
@@ -513,7 +628,7 @@ while (running_.load(std::memory_order_relaxed)) {
 ## Destructor
 
 ```cpp
-running_.store(false, std::memory_order_relaxed);
+running_.store(false, std::memory_order_release);
 join threads;
 ```
 
@@ -521,9 +636,10 @@ join threads;
 
 ## Explanation
 
+* every spin path consults `running_`, so workers can exit even if no new ingress arrives
+* shutdown is driven by the request source rather than by a shared publication register
 * ensures clean shutdown
-* no synchronization overhead
-* avoids deadlocks
+* avoids deadlocks during `join`
 
 ---
 
@@ -533,38 +649,48 @@ After applying all improvements:
 
 ---
 
-## Execution Flow
+## Replica Provisioning
 
-### Producer
+1. allocate hugepage-backed replica regions
+2. place or validate replicas on sufficiently independent memory paths
+3. bind memory to the correct NUMA node before first touch
+4. populate immutable replica contents before worker startup whenever possible
 
-1. write replicated data
-2. reset `states[i].done = false`
-3. publish `global_seq = i`
+## Ingress
 
-### Workers (parallel)
+1. duplicate each logical request to every worker before the worker hot path begins
+2. preserve one worker per replica on one distinct core
 
-1. observe new sequence
-2. compute ring index
-3. read from replica
-4. race via `done.exchange`
-5. fastest worker executes `final_work`
+## Workers (parallel)
+
+1. wait for the duplicated request on the worker’s own input path
+2. compute the logical index for that request
+3. read from the worker’s replica
+4. execute `final_work` independently on that core as a pure compute or candidate-construction stage
+
+## Loser Suppression
+
+1. deduplicate downstream, in the NIC / gateway, or in a non-critical observer keyed by `request_id`
+2. do not insert a shared winner flag into the worker read path unless deliberately accepting a slower compatibility mode
 
 ---
 
 ## Memory
 
 * hugepage-backed
-* NUMA-bound
-* channel-independent
+* NUMA-bound before first touch
+* channel-independent by paired statistical validation
+* preferably immutable during steady-state reads
 
 ---
 
 ## Concurrency Model
 
 * no locks
-* no shared hot-path contention
-* single-writer, multi-reader broadcast
-* per-request winner arbitration
+* no inter-worker atomics on the hot read path
+* no shared destructive reads
+* separate cores avoid single-core ROB head-of-line blocking
+* optional live-update synchronization exists only if mutable replica storage is explicitly enabled
 
 ---
 
@@ -572,9 +698,9 @@ After applying all improvements:
 
 With these improvements, the system becomes:
 
-* **formally correct under the C++ memory model**
-* **aligned with real DRAM and CPU behavior**
-* **continuously operable without degradation**
+* **formally correct under the C++ memory model when both replica publication and request-delivery paths satisfy the stated publication contracts**
+* **aligned with the creator’s intended multi-core execution model**
+* **continuously operable without degrading the hot path with shared-state arbitration**
 * **capable of true tail-latency elimination in practice**
 
 The architecture itself remains unchanged; these additions complete the system by ensuring correctness, stability, and hardware fidelity.
